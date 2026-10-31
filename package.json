@@ -1,0 +1,35 @@
+{
+  "name": "claude-prune",
+  "version": "0.1.0",
+  "description": "The intelligent garbage collector and cache-shield for Claude Code sessions",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "claude-prune": "bin/claude-prune.js",
+    "cprune": "bin/claude-prune.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "test": "node --test dist/**/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "cache",
+    "token-optimizer",
+    "jsonl",
+    "prune",
+    "anthropic",
+    "ai-agent",
+    "context-compactor"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}

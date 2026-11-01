@@ -99,11 +99,9 @@ export async function pruneSessionFile(filePath, options = {}) {
             backupPath = `${filePath}.bak.jsonl`;
             fs.copyFileSync(filePath, backupPath);
         }
-        // Write pruned output using atomic temp file
-        const tempPath = `${filePath}.tmp.${Date.now()}`;
+        // Write pruned output safely with retry and fallback for Windows file locks
         const outputLines = prunedEvents.map((ev) => JSON.stringify(ev)).join("\n") + "\n";
-        fs.writeFileSync(tempPath, outputLines, { encoding: "utf-8" });
-        fs.renameSync(tempPath, filePath);
+        safeWriteFile(filePath, outputLines);
     }
     const newSizeBytes = options.dryRun
         ? Math.round(originalStat.size * (1 - savingsPercent / 100))
@@ -121,6 +119,60 @@ export async function pruneSessionFile(filePath, options = {}) {
         toolOutputsTruncated,
         thinkingBlocksCompressed,
     };
+}
+/**
+ * Safely writes pruned output to disk with retry backoff and Windows lock resolution.
+ * Prevents EPERM errors when Claude Code holds an open handle to the active session.
+ */
+function safeWriteFile(filePath, content) {
+    const tempPath = `${filePath}.tmp.${Date.now()}`;
+    try {
+        fs.writeFileSync(tempPath, content, { encoding: "utf-8" });
+        // Windows retry loop for renameSync (handles temporary lock while Claude Code flushes)
+        let retries = 5;
+        let delay = 100;
+        while (retries > 0) {
+            try {
+                fs.renameSync(tempPath, filePath);
+                return; // Success!
+            }
+            catch (err) {
+                if (err.code === "EPERM" || err.code === "EBUSY") {
+                    retries--;
+                    if (retries === 0) {
+                        // Fallback: Copy content directly then remove temp file
+                        try {
+                            fs.copyFileSync(tempPath, filePath);
+                            try {
+                                fs.unlinkSync(tempPath);
+                            }
+                            catch { }
+                            return; // Success via copy fallback!
+                        }
+                        catch {
+                            throw err; // rethrow original EPERM if copy also failed
+                        }
+                    }
+                    // Synchronous sleep for file handle release
+                    const stop = Date.now() + delay;
+                    while (Date.now() < stop) { }
+                    delay *= 1.5;
+                }
+                else {
+                    throw err;
+                }
+            }
+        }
+    }
+    finally {
+        // Ensure temporary file never lingers on disk
+        if (fs.existsSync(tempPath)) {
+            try {
+                fs.unlinkSync(tempPath);
+            }
+            catch { }
+        }
+    }
 }
 /**
  * Truncates oversized string or object tool results while preserving head and tail.

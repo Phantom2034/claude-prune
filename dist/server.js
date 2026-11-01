@@ -84,23 +84,32 @@ export function startLocalDashboard(options = {}) {
                         debounceTimer = setTimeout(async () => {
                             if (!autoShieldEnabled)
                                 return;
-                            const sessions = discoverSessions();
-                            if (sessions.length > 0) {
-                                const latest = sessions[0];
-                                const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
-                                if (res.tokensSaved > 0) {
-                                    await getOrComputeStats(true); // invalidate cache
-                                    broadcast("shield_event", {
-                                        project: latest.projectDisplayName,
-                                        file: latest.fileName,
-                                        tokensSaved: res.tokensSaved,
-                                        deadForks: res.deadEventsRemoved,
-                                        logsTruncated: res.toolOutputsTruncated,
-                                        message: `Auto-shielded ${latest.fileName.slice(0, 14)}: Spared ${formatTokens(res.tokensSaved)} tokens`,
-                                    });
+                            try {
+                                const sessions = discoverSessions();
+                                if (sessions.length > 0) {
+                                    const latest = sessions[0];
+                                    const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
+                                    if (res.tokensSaved > 0) {
+                                        await getOrComputeStats(true); // invalidate cache
+                                        broadcast("shield_event", {
+                                            project: latest.projectDisplayName,
+                                            file: latest.fileName,
+                                            tokensSaved: res.tokensSaved,
+                                            deadForks: res.deadEventsRemoved,
+                                            logsTruncated: res.toolOutputsTruncated,
+                                            message: `Auto-shielded ${latest.fileName.slice(0, 14)}: Spared ${formatTokens(res.tokensSaved)} tokens`,
+                                        });
+                                    }
                                 }
                             }
-                        }, 1200);
+                            catch (err) {
+                                // If Claude Code is actively writing, silently wait for next idle turn
+                                if (err.code === "EPERM" || err.code === "EBUSY") {
+                                    return;
+                                }
+                                console.error("Auto-shield notice:", err.message);
+                            }
+                        }, 2000); // 2 second idle debounce
                     }
                 });
             }

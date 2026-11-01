@@ -251,20 +251,29 @@ async function handleWatchCommand(args) {
                 if (debounceTimer)
                     clearTimeout(debounceTimer);
                 debounceTimer = setTimeout(async () => {
-                    const sessions = discoverSessions();
-                    if (sessions.length > 0) {
-                        const latest = sessions[0];
-                        const timestamp = new Date().toLocaleTimeString();
-                        process.stdout.write(`\r  [${timestamp}] Active session updated: ${c.cyan}${latest.fileName.slice(0, 16)}${c.reset} `);
-                        const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
-                        if (res.tokensSaved > 500) {
-                            console.log(`${c.green}${g.shield} Shielded! Spared ${formatTokens(res.tokensSaved)} cache tokens.${c.reset}`);
-                        }
-                        else {
-                            process.stdout.write(`${c.dim}(clean)${c.reset}\n`);
+                    try {
+                        const sessions = discoverSessions();
+                        if (sessions.length > 0) {
+                            const latest = sessions[0];
+                            const timestamp = new Date().toLocaleTimeString();
+                            process.stdout.write(`\r  [${timestamp}] Active session updated: ${c.cyan}${latest.fileName.slice(0, 16)}${c.reset} `);
+                            const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
+                            if (res.tokensSaved > 500) {
+                                console.log(`${c.green}${g.shield} Shielded! Spared ${formatTokens(res.tokensSaved)} cache tokens.${c.reset}`);
+                            }
+                            else {
+                                process.stdout.write(`${c.dim}(clean)${c.reset}\n`);
+                            }
                         }
                     }
-                }, 1500);
+                    catch (err) {
+                        if (err.code === "EPERM" || err.code === "EBUSY") {
+                            process.stdout.write(`${c.dim}(busy, retrying)${c.reset}\n`);
+                            return;
+                        }
+                        console.error(`\n${c.red}Shield notice:${c.reset} ${err.message}`);
+                    }
+                }, 2000);
             }
         });
     }

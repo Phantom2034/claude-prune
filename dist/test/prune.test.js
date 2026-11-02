@@ -26,8 +26,10 @@ test("1. analyzeConversationGraph identifies complex multi-branch forks and /com
         { uuid: "t4", parentUuid: "t3", type: "user", message: { content: "Finish task" } },
     ];
     const uuidMap = new Map();
-    for (const e of events)
-        uuidMap.set(e.uuid, e);
+    for (const e of events) {
+        if (e.uuid)
+            uuidMap.set(e.uuid, e);
+    }
     const { activeUuids, deadBranchUuids, latestLeafUuid } = analyzeConversationGraph(events, uuidMap);
     assert.equal(latestLeafUuid, "t4");
     assert.equal(activeUuids.size, 5); // root, t1, t2, t3, t4
@@ -146,4 +148,86 @@ test("5. Scale Benchmark: Efficiently processes 50+ turn multi-megabyte sessions
     assert.ok(result.thinkingBlocksCompressed > 0, "Should compress historical thinking blocks");
     assert.ok(durationMs < 500, `Pruning should execute in under 500ms (took ${durationMs}ms)`);
     fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+test("6. Codex CLI Support: Accurately preserves linear timeline and truncates bloated exec_command outputs", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-prune-test-"));
+    const rolloutFile = path.join(tmpDir, "rollout-2026-11-01T12-00-00-abc123.jsonl");
+    // OpenAI Codex CLI rollout format: sequential events, no parentUuid, function_call_output with bloated stdout
+    const codexEvents = [
+        { role: "user", content: "Run the full test suite and fix failures." },
+        {
+            role: "assistant",
+            reasoning_content: "I need to analyze the codebase structure and run pytest. ".repeat(25),
+            content: "Running tests with exec_command...",
+        },
+        {
+            type: "function_call",
+            name: "exec_command",
+            arguments: { cmd: "pytest --verbose tests/" },
+        },
+        {
+            type: "function_call_output",
+            name: "exec_command",
+            output: "test_core.py::test_eval PASSED\n".repeat(200) + "FAILED tests/test_db.py\nAssertionError: connection timeout",
+        },
+        {
+            role: "assistant",
+            content: "I identified the timeout error in test_db.py.",
+        },
+        { role: "user", content: "Please fix the timeout configuration." },
+        { role: "assistant", content: "Updated default database timeout to 30s." },
+        { role: "user", content: "Confirmed, tests pass now!" },
+    ];
+    fs.writeFileSync(rolloutFile, codexEvents.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf-8");
+    // 1. Verify parsing preserves all turns on linear timeline (0 dead branches)
+    const tree = await parseSessionFile(rolloutFile);
+    assert.equal(tree.events.length, 8);
+    assert.equal(tree.deadBranchUuids.size, 0, "Codex linear session must not treat earlier turns as dead branches");
+    assert.equal(tree.activeUuids.size, 8, "All linear turns must be active");
+    // 2. Prune the Codex session
+    const res = await pruneSessionFile(rolloutFile, { maxToolOutputChars: 500, createBackup: true });
+    assert.ok(res.tokensSaved > 1000, "Should save significant tokens from bloated pytest log and reasoning");
+    assert.equal(res.deadEventsRemoved, 0, "No active conversation turns should be evicted");
+    assert.ok(res.toolOutputsTruncated >= 1, "exec_command output should be truncated");
+    assert.ok(res.thinkingBlocksCompressed >= 1, "Historical reasoning_content should be compressed");
+    // 3. Verify pruned file is valid JSONL and retains schema
+    const prunedLines = fs.readFileSync(rolloutFile, "utf-8").trim().split("\n");
+    assert.equal(prunedLines.length, 8, "Pruned file must retain all 8 turns");
+    const outputEvent = JSON.parse(prunedLines[3]);
+    assert.ok(outputEvent.output.includes("claude-prune: truncated"), "Output must contain safe truncation marker");
+    // 4. Verify bit-for-bit restore
+    assert.equal(restoreBackup(rolloutFile), true);
+    const restoredLines = fs.readFileSync(rolloutFile, "utf-8").trim().split("\n");
+    assert.equal(JSON.parse(restoredLines[3]).output.length, codexEvents[3].output.length, "Restored file must match original exactly");
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+test("7. Multi-Agent Discovery: Correctly classifies Claude Code and Codex CLI session types", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "multi-agent-discover-"));
+    // Create mock Claude session
+    const claudeDir = path.join(tmpDir, ".claude", "projects", "C--Users-test-myproject");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const claudeFile = path.join(claudeDir, "session-12345.jsonl");
+    fs.writeFileSync(claudeFile, JSON.stringify({ uuid: "c1", parentUuid: null, type: "user", message: { content: "hi" } }) + "\n");
+    // Create mock Codex session
+    const codexDir = path.join(tmpDir, ".codex", "sessions", "2026", "11", "02");
+    fs.mkdirSync(codexDir, { recursive: true });
+    const codexFile = path.join(codexDir, "rollout-2026-11-02-abc.jsonl");
+    fs.writeFileSync(codexFile, JSON.stringify({ role: "user", content: "hello codex" }) + "\n");
+    // Set environment overrides
+    process.env.CLAUDE_CONFIG_DIR = path.join(tmpDir, ".claude");
+    process.env.CODEX_HOME = path.join(tmpDir, ".codex");
+    try {
+        const all = (await import("../locator.js")).discoverSessions();
+        const claudeFound = all.find((s) => s.agentType === "claude");
+        const codexFound = all.find((s) => s.agentType === "codex");
+        assert.ok(claudeFound, "Should discover Claude session");
+        assert.equal(claudeFound?.agentType, "claude");
+        assert.ok(codexFound, "Should discover Codex session");
+        assert.equal(codexFound?.agentType, "codex");
+    }
+    finally {
+        delete process.env.CLAUDE_CONFIG_DIR;
+        delete process.env.CODEX_HOME;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
 });

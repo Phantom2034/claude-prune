@@ -1,6 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
-import { discoverSessions, getClaudeProjectsDir } from "./locator.js";
+import { discoverSessions, getClaudeProjectsDir, getCodexSessionsDir } from "./locator.js";
 import { analyzeSession } from "./tree.js";
 import { pruneSessionFile, restoreBackup } from "./pruner.js";
 import { formatTokens, formatBytes, formatCurrency, estimateCacheReadCost } from "./meter.js";
@@ -100,25 +100,35 @@ export async function runCli(args = process.argv.slice(2)) {
 async function handleScanCommand(args) {
     printHeader();
     const targetPath = getArgValue(args, "--target", "-t");
-    const sessions = discoverSessions(targetPath);
+    const rawAgent = getArgValue(args, "--agent");
+    const agentFilter = (rawAgent === "claude" || rawAgent === "codex") ? rawAgent : undefined;
+    const sessions = discoverSessions(targetPath, agentFilter);
     if (sessions.length === 0) {
-        console.log(`\n${c.yellow}No Claude Code sessions found.${c.reset}`);
-        console.log(`Looked in: ${c.dim}${getClaudeProjectsDir()}${c.reset}\n`);
-        console.log(`Tip: If your Claude Code is configured elsewhere, pass ${c.cyan}--target <path>${c.reset} or set ${c.cyan}CLAUDE_CONFIG_DIR${c.reset}.\n`);
+        console.log(`\n${c.yellow}No AI agent sessions found.${c.reset}`);
+        console.log(`Checked paths:`);
+        console.log(`  Claude: ${c.dim}${getClaudeProjectsDir()}${c.reset}`);
+        console.log(`  Codex : ${c.dim}${getCodexSessionsDir()}${c.reset}\n`);
+        console.log(`Tip: If configured elsewhere, pass ${c.cyan}--target <path>${c.reset} or set ${c.cyan}CLAUDE_CONFIG_DIR${c.reset} / ${c.cyan}CODEX_HOME${c.reset}.\n`);
         return;
     }
-    process.stdout.write(`Analyzing ${c.bold}${sessions.length}${c.reset} sessions across Claude projects... `);
+    process.stdout.write(`Analyzing ${c.bold}${sessions.length}${c.reset} sessions across AI agents... `);
     const analyses = [];
     let totalRawTokens = 0;
     let totalSavedTokens = 0;
     let totalSizeBytes = 0;
+    let claudeCount = 0;
+    let codexCount = 0;
     for (const session of sessions) {
         try {
-            const analysis = await analyzeSession(session.filePath, session.projectDisplayName);
+            const analysis = await analyzeSession(session.filePath, session.projectDisplayName, { agentType: session.agentType });
             analyses.push(analysis);
             totalRawTokens += analysis.rawEstimatedTokens;
             totalSavedTokens += analysis.tokensSaved;
             totalSizeBytes += analysis.fileSizeBytes;
+            if (session.agentType === "codex")
+                codexCount++;
+            else
+                claudeCount++;
         }
         catch {
             // Ignore unreadable session
@@ -130,12 +140,12 @@ async function handleScanCommand(args) {
         : 0;
     const estimatedDollarsSaved = estimateCacheReadCost(totalSavedTokens, 20);
     const bar = renderBar(totalSavingsPercent, 14);
-    const W = 68;
+    const W = 70;
     const hLine = g.h.repeat(W);
     console.log(`${c.cyan}${g.tl}${hLine}${g.tr}${c.reset}`);
-    console.log(`${c.cyan}${g.v}${c.reset}  ${c.bold}CACHE HEALTH & METRICS AUDIT${c.reset}${" ".repeat(W - 30)}${c.cyan}${g.v}${c.reset}`);
+    console.log(`${c.cyan}${g.v}${c.reset}  ${c.bold}MULTI-AGENT CACHE HEALTH & AUDIT REPORT${c.reset}${" ".repeat(W - 41)}${c.cyan}${g.v}${c.reset}`);
     console.log(`${c.cyan}${g.div}${hLine}${g.rdiv}${c.reset}`);
-    console.log(`${c.cyan}${g.v}${c.reset}  ${c.dim}Total Session Files :${c.reset} ${c.bold}${sessions.length.toString().padEnd(4)}${c.reset} (${formatBytes(totalSizeBytes)})`.padEnd(W + 8) + `${c.cyan}${g.v}${c.reset}`);
+    console.log(`${c.cyan}${g.v}${c.reset}  ${c.dim}Discovered Sessions :${c.reset} ${c.bold}${sessions.length.toString().padEnd(4)}${c.reset} [${c.cyan}Claude: ${claudeCount}${c.reset}, ${c.magenta}Codex: ${codexCount}${c.reset}] (${formatBytes(totalSizeBytes)})`.padEnd(W + 28) + `${c.cyan}${g.v}${c.reset}`);
     console.log(`${c.cyan}${g.v}${c.reset}  ${c.dim}Active Context Pool :${c.reset} ${formatTokens(totalRawTokens).padEnd(10)} tokens`.padEnd(W + 8) + `${c.cyan}${g.v}${c.reset}`);
     console.log(`${c.cyan}${g.v}${c.reset}  ${c.dim}Redundant Dead Weight:${c.reset} ${c.red}${c.bold}${formatTokens(totalSavedTokens).padEnd(10)}${c.reset} tokens ${c.yellow}${bar} ${totalSavingsPercent}%${c.reset}`.padEnd(W + 27) + `${c.cyan}${g.v}${c.reset}`);
     console.log(`${c.cyan}${g.v}${c.reset}${" ".repeat(W)}${c.cyan}${g.v}${c.reset}`);
@@ -143,23 +153,26 @@ async function handleScanCommand(args) {
     console.log(`${c.cyan}${g.bl}${hLine}${g.br}${c.reset}\n`);
     // Top Bloated Sessions
     console.log(`${c.bold}TOP SESSIONS WITH CACHE BLOAT:${c.reset}`);
-    console.log(`${c.dim}${"-".repeat(70)}${c.reset}`);
-    console.log(`  ${"PROJECT / SESSION".padEnd(32)} ${"TOKENS".padEnd(12)} ${"SAVINGS".padEnd(13)} ${"DEAD FORKS"}`);
-    console.log(`${c.dim}${"-".repeat(70)}${c.reset}`);
+    console.log(`${c.dim}${"-".repeat(74)}${c.reset}`);
+    console.log(`  ${"AGENT".padEnd(8)} ${"PROJECT / SESSION".padEnd(30)} ${"TOKENS".padEnd(11)} ${"SAVINGS".padEnd(12)} ${"DETAILS"}`);
+    console.log(`${c.dim}${"-".repeat(74)}${c.reset}`);
     analyses.sort((a, b) => b.tokensSaved - a.tokensSaved);
     const displayLimit = Math.min(analyses.length, 7);
     for (let i = 0; i < displayLimit; i++) {
         const a = analyses[i];
-        const projName = path.basename(a.projectName).slice(0, 14);
-        const sessName = a.fileName.slice(0, 13);
-        const displayName = `${projName} / ${sessName}`;
+        const agentBadge = a.agentType === "codex" ? `${c.magenta}[Codex]${c.reset} ` : `${c.cyan}[Claude]${c.reset}`;
+        const projName = path.basename(a.projectName).slice(0, 13);
+        const sessName = a.fileName.slice(0, 12);
+        const displayName = `${projName}/${sessName}`;
         const savingsColor = a.savingsPercent >= 70 ? c.green : a.savingsPercent >= 30 ? c.yellow : c.dim;
-        const deadForkDisplay = a.deadBranchEvents > 0
-            ? `${c.red}${a.deadBranchEvents.toLocaleString()} dead${c.reset}`
-            : `${c.dim}0 clean${c.reset}`;
-        console.log(`  ${displayName.padEnd(32)} ${formatTokens(a.rawEstimatedTokens).padEnd(12)} ${savingsColor}${a.savingsPercent}% (${formatTokens(a.tokensSaved)})${c.reset}`.padEnd(60) + ` ${deadForkDisplay}`);
+        const detailsDisplay = a.deadBranchEvents > 0
+            ? `${c.red}${a.deadBranchEvents.toLocaleString()} dead forks${c.reset}`
+            : a.oversizedToolOutputs > 0
+                ? `${c.yellow}${a.oversizedToolOutputs} tool logs${c.reset}`
+                : `${c.dim}clean${c.reset}`;
+        console.log(`  ${agentBadge.padEnd(17)} ${displayName.padEnd(30)} ${formatTokens(a.rawEstimatedTokens).padEnd(11)} ${savingsColor}${a.savingsPercent}% (${formatTokens(a.tokensSaved)})${c.reset}`.padEnd(68) + ` ${detailsDisplay}`);
     }
-    console.log(`${c.dim}${"-".repeat(70)}${c.reset}\n`);
+    console.log(`${c.dim}${"-".repeat(74)}${c.reset}\n`);
     console.log(`  ${c.cyan}${g.arrow}${c.reset} Run ${c.green}${c.bold}node bin/claude-prune.js prune --all${c.reset} to purge dead tokens across all sessions.`);
     console.log(`  ${c.dim}(Creates automatic .bak.jsonl backups. Revert anytime with 'restore')${c.reset}\n`);
 }
@@ -167,12 +180,14 @@ async function handlePruneCommand(args) {
     const isDryRun = args.includes("--dry-run");
     const pruneAll = args.includes("--all") || args.includes("-a");
     const targetPath = getArgValue(args, "--target", "-t");
+    const rawAgent = getArgValue(args, "--agent");
+    const agentFilter = (rawAgent === "claude" || rawAgent === "codex") ? rawAgent : undefined;
     const noBackup = args.includes("--no-backup");
     printHeader();
     if (isDryRun) {
         console.log(`  ${c.yellow}${c.bold}[SIMULATION MODE - DRY RUN]${c.reset} No files will be modified.\n`);
     }
-    const sessions = discoverSessions(targetPath);
+    const sessions = discoverSessions(targetPath, agentFilter);
     if (sessions.length === 0) {
         console.log(`${c.yellow}No sessions found to prune.${c.reset}`);
         return;
@@ -184,8 +199,9 @@ async function handlePruneCommand(args) {
     let totalDeadEvicted = 0;
     let totalLogsTruncated = 0;
     for (const session of targetsToPrune) {
-        const shortName = `${path.basename(session.projectDisplayName)}/${session.fileName.slice(0, 18)}...`;
-        process.stdout.write(`  ${c.dim}Pruning${c.reset} ${shortName.padEnd(36)} `);
+        const agentBadge = session.agentType === "codex" ? `${c.magenta}[Codex]${c.reset}` : `${c.cyan}[Claude]${c.reset}`;
+        const shortName = `${path.basename(session.projectDisplayName)}/${session.fileName.slice(0, 16)}...`;
+        process.stdout.write(`  ${agentBadge} ${c.dim}Pruning${c.reset} ${shortName.padEnd(32)} `);
         try {
             const res = await pruneSessionFile(session.filePath, {
                 dryRun: isDryRun,
@@ -236,50 +252,61 @@ async function handleAppCommand(args) {
 }
 async function handleWatchCommand(args) {
     printHeader();
-    console.log(`  ${c.green}${g.shield} Background Cache Shield Active${c.reset}`);
-    console.log(`  Monitoring active Claude Code sessions for cache bloat...`);
+    console.log(`  ${c.green}${g.shield} Multi-Agent Background Cache Shield Active${c.reset}`);
+    console.log(`  Monitoring active Claude Code and Codex CLI sessions for cache bloat...`);
     console.log(`  ${c.dim}Press Ctrl+C to stop.${c.reset}\n`);
-    const projectsDir = getClaudeProjectsDir();
-    if (!fs.existsSync(projectsDir)) {
-        console.log(`${c.red}Claude projects directory does not exist at:${c.reset} ${projectsDir}`);
+    const watchDirs = [];
+    const claudeDir = getClaudeProjectsDir();
+    if (fs.existsSync(claudeDir))
+        watchDirs.push({ name: "Claude", dir: claudeDir });
+    const codexDir = getCodexSessionsDir();
+    if (fs.existsSync(codexDir))
+        watchDirs.push({ name: "Codex", dir: codexDir });
+    if (watchDirs.length === 0) {
+        console.log(`${c.red}Neither Claude nor Codex session directories exist.${c.reset}`);
         return;
     }
     let debounceTimer = null;
-    try {
-        fs.watch(projectsDir, { recursive: true }, (_eventType, filename) => {
-            if (filename && filename.endsWith(".jsonl") && !filename.endsWith(".bak.jsonl") && !filename.includes(".tmp.")) {
-                if (debounceTimer)
-                    clearTimeout(debounceTimer);
-                debounceTimer = setTimeout(async () => {
-                    try {
-                        const sessions = discoverSessions();
-                        if (sessions.length > 0) {
-                            const latest = sessions[0];
-                            const timestamp = new Date().toLocaleTimeString();
-                            process.stdout.write(`\r  [${timestamp}] Active session updated: ${c.cyan}${latest.fileName.slice(0, 16)}${c.reset} `);
-                            const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
-                            if (res.tokensSaved > 500) {
-                                console.log(`${c.green}${g.shield} Shielded! Spared ${formatTokens(res.tokensSaved)} cache tokens.${c.reset}`);
-                            }
-                            else {
-                                process.stdout.write(`${c.dim}(clean)${c.reset}\n`);
+    for (const { name, dir } of watchDirs) {
+        try {
+            fs.watch(dir, { recursive: true }, (_eventType, filename) => {
+                if (filename && filename.endsWith(".jsonl") && !filename.endsWith(".bak.jsonl") && !filename.includes(".tmp.")) {
+                    if (debounceTimer)
+                        clearTimeout(debounceTimer);
+                    debounceTimer = setTimeout(async () => {
+                        try {
+                            const sessions = discoverSessions();
+                            if (sessions.length > 0) {
+                                const latest = sessions[0];
+                                const timestamp = new Date().toLocaleTimeString();
+                                const agentTag = latest.agentType === "codex" ? `${c.magenta}[Codex]${c.reset}` : `${c.cyan}[Claude]${c.reset}`;
+                                process.stdout.write(`\r  [${timestamp}] ${agentTag} Active session updated: ${latest.fileName.slice(0, 16)} `);
+                                const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
+                                if (res.tokensSaved > 500) {
+                                    console.log(`${c.green}${g.shield} Shielded! Spared ${formatTokens(res.tokensSaved)} cache tokens.${c.reset}`);
+                                }
+                                else {
+                                    process.stdout.write(`${c.dim}(clean)${c.reset}\n`);
+                                }
                             }
                         }
-                    }
-                    catch (err) {
-                        if (err.code === "EPERM" || err.code === "EBUSY") {
-                            process.stdout.write(`${c.dim}(busy, retrying)${c.reset}\n`);
-                            return;
+                        catch (err) {
+                            if (err.code === "EPERM" || err.code === "EBUSY") {
+                                process.stdout.write(`${c.dim}(busy, retrying)${c.reset}\n`);
+                                return;
+                            }
+                            console.error(`\n${c.red}Shield notice:${c.reset} ${err.message}`);
                         }
-                        console.error(`\n${c.red}Shield notice:${c.reset} ${err.message}`);
-                    }
-                }, 2000);
-            }
-        });
+                    }, 2000);
+                }
+            });
+            console.log(`  ${c.green}${g.check}${c.reset} Watching ${name} directory: ${c.dim}${dir}${c.reset}`);
+        }
+        catch (err) {
+            console.log(`${c.red}Watcher error for ${name}: ${err.message}${c.reset}`);
+        }
     }
-    catch (err) {
-        console.log(`${c.red}Watcher error: ${err.message}${c.reset}`);
-    }
+    console.log("");
 }
 function handleRestoreCommand(args) {
     printHeader();
@@ -321,19 +348,20 @@ function printHelp() {
   $ node bin/claude-prune.js <command> [options]
 
 COMMANDS:
-  scan     Audit all Claude Code sessions for dead branches and cache bloat (default)
+  scan     Audit all Claude Code & Codex CLI sessions for cache bloat (default)
   prune    Safely compact active sessions, evicting dead forks and truncating logs
   app      Launch the local real-time desktop dashboard (http://127.0.0.1:3847)
   watch    Real-time background daemon to keep active sessions under token limits
   restore  Revert changes using automatic .bak.jsonl backups
 
 OPTIONS:
-  --all, -a       Prune all sessions (default prunes only the most recent)
-  --dry-run       Simulate pruning without modifying files
-  --no-backup     Do not create .bak.jsonl backup files
+  --agent <type>   Filter by agent: 'claude', 'codex', or all (default)
+  --all, -a        Prune all sessions (default prunes only the most recent)
+  --dry-run        Simulate pruning without modifying files
+  --no-backup      Do not create .bak.jsonl backup files
   --target, -t <p> Path to a specific project folder or .jsonl file
-  -v, --version   Show version
-  -h, --help      Show help
+  -v, --version    Show version
+  -h, --help       Show help
 `);
 }
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("cli.js") || process.argv[1]?.endsWith("cli.ts")) {

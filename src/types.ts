@@ -1,11 +1,25 @@
-export interface ClaudeEvent {
-  uuid: string;
-  parentUuid: string | null;
-  type: string; // "user" | "assistant" | "system" | "compact_boundary" etc.
+export type AgentType = "claude" | "codex";
+
+export interface AgentEvent {
+  uuid?: string;
+  id?: string;
+  parentUuid?: string | null;
+  parentId?: string | null;
+  parent_id?: string | null;
+  type?: string; // "user" | "assistant" | "system" | "function_call" | "function_call_output" | etc.
   sessionId?: string;
   timestamp?: string;
   cwd?: string;
   gitBranch?: string;
+  role?: string; // "user" | "assistant" | "system" | "tool"
+  name?: string; // tool name e.g. "exec_command", "apply_patch"
+  output?: any;
+  stdout?: any;
+  stderr?: any;
+  arguments?: any;
+  payload?: any;
+  reasoning_content?: string;
+  thought?: string;
   message?: {
     role?: string;
     content?: string | Array<ContentBlock>;
@@ -15,6 +29,9 @@ export interface ClaudeEvent {
   thinking?: any;
   [key: string]: any;
 }
+
+// Alias for backwards compatibility
+export type ClaudeEvent = AgentEvent;
 
 export interface ContentBlock {
   type: string; // "text" | "tool_use" | "tool_result" | "thinking"
@@ -32,6 +49,7 @@ export interface SessionAnalysis {
   filePath: string;
   fileName: string;
   projectName: string;
+  agentType: AgentType;
   fileSizeBytes: number;
   totalEvents: number;
   activeEvents: number;
@@ -55,6 +73,7 @@ export interface GlobalAuditReport {
 }
 
 export interface PruneOptions {
+  agentType?: AgentType;
   dryRun?: boolean;
   createBackup?: boolean;
   truncateToolOutputs?: boolean;

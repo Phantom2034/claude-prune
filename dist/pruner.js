@@ -21,16 +21,22 @@ export async function pruneSessionFile(filePath, options = {}) {
     for (let index = 0; index < totalEventsCount; index++) {
         const event = tree.events[index];
         // 1. Evict dead branches / orphaned forks
-        if (pruneDead && tree.deadBranchUuids.has(event.uuid)) {
+        if (pruneDead && event.uuid && tree.deadBranchUuids.has(event.uuid)) {
             deadEventsRemoved++;
             continue;
         }
         // Clone event to avoid modifying in-memory originals
         const prunedEvent = JSON.parse(JSON.stringify(event));
+        // If UUID was synthesized for an event that didn't have one originally, restore clean schema
+        if (prunedEvent._synthUuid) {
+            delete prunedEvent.uuid;
+            delete prunedEvent._synthUuid;
+        }
         // Is this an older turn? (e.g. not in the latest 3 turns)
         const isHistoricalTurn = index < totalEventsCount - 3;
         // 2. Prune and truncate oversized tool outputs
         if (truncateTools) {
+            // Claude Code top-level tool_result
             if (prunedEvent.tool_result) {
                 const truncated = truncateOutputPayload(prunedEvent.tool_result, maxToolChars);
                 if (truncated.didTruncate) {
@@ -38,7 +44,7 @@ export async function pruneSessionFile(filePath, options = {}) {
                     toolOutputsTruncated++;
                 }
             }
-            // Check tool_result inside message.content array
+            // Claude Code tool_result inside message.content array
             if (Array.isArray(prunedEvent.message?.content)) {
                 prunedEvent.message.content = prunedEvent.message.content.map((block) => {
                     if (block.type === "tool_result") {
@@ -54,10 +60,10 @@ export async function pruneSessionFile(filePath, options = {}) {
                             }
                         }
                     }
-                    // 3. Compress historical extended thinking blocks
+                    // 3. Compress historical extended thinking blocks (Claude Code)
                     if (collapseThinking && isHistoricalTurn && (block.type === "thinking" || block.thinking)) {
                         const thinkingText = block.thinking || block.text || "";
-                        if (thinkingText.length > 500) {
+                        if (thinkingText.length > 500 && !thinkingText.includes("historical thinking compressed")) {
                             thinkingBlocksCompressed++;
                             const collapsed = `[claude-prune: historical thinking compressed (${Math.round(thinkingText.length / 3.8)} tokens saved)]`;
                             if (block.thinking)
@@ -69,15 +75,56 @@ export async function pruneSessionFile(filePath, options = {}) {
                     return block;
                 });
             }
+            // Codex CLI: output (function_call_output, exec_command, etc.)
+            if (prunedEvent.output) {
+                const truncated = truncateOutputPayload(prunedEvent.output, maxToolChars);
+                if (truncated.didTruncate) {
+                    prunedEvent.output = truncated.data;
+                    toolOutputsTruncated++;
+                }
+            }
+            // Codex CLI: stdout and stderr
+            if (typeof prunedEvent.stdout === "string") {
+                const truncated = truncateOutputPayload(prunedEvent.stdout, maxToolChars);
+                if (truncated.didTruncate) {
+                    prunedEvent.stdout = truncated.data;
+                    toolOutputsTruncated++;
+                }
+            }
+            if (typeof prunedEvent.stderr === "string") {
+                const truncated = truncateOutputPayload(prunedEvent.stderr, maxToolChars);
+                if (truncated.didTruncate) {
+                    prunedEvent.stderr = truncated.data;
+                    toolOutputsTruncated++;
+                }
+            }
+            // OpenAI / Codex: role === "tool" message content
+            if (prunedEvent.role === "tool" && typeof prunedEvent.content === "string") {
+                const truncated = truncateOutputPayload(prunedEvent.content, maxToolChars);
+                if (truncated.didTruncate) {
+                    prunedEvent.content = truncated.data;
+                    toolOutputsTruncated++;
+                }
+            }
         }
-        // 4. Compress top-level thinking if present on older turns
-        if (collapseThinking && isHistoricalTurn && prunedEvent.thinking) {
-            const thinkingStr = typeof prunedEvent.thinking === "string"
-                ? prunedEvent.thinking
-                : JSON.stringify(prunedEvent.thinking);
-            if (thinkingStr.length > 500) {
+        // Historical thinking / reasoning compression (Claude Code + Codex)
+        if (collapseThinking && isHistoricalTurn) {
+            if (prunedEvent.thinking) {
+                const thinkingStr = typeof prunedEvent.thinking === "string"
+                    ? prunedEvent.thinking
+                    : JSON.stringify(prunedEvent.thinking);
+                if (thinkingStr.length > 500 && !thinkingStr.includes("historical thinking compressed")) {
+                    thinkingBlocksCompressed++;
+                    prunedEvent.thinking = "[claude-prune: historical thinking compressed]";
+                }
+            }
+            if (typeof prunedEvent.reasoning_content === "string" && prunedEvent.reasoning_content.length > 500 && !prunedEvent.reasoning_content.includes("historical thinking compressed")) {
                 thinkingBlocksCompressed++;
-                prunedEvent.thinking = "[claude-prune: historical thinking compressed]";
+                prunedEvent.reasoning_content = "[claude-prune: historical thinking compressed]";
+            }
+            if (typeof prunedEvent.thought === "string" && prunedEvent.thought.length > 500 && !prunedEvent.thought.includes("historical thinking compressed")) {
+                thinkingBlocksCompressed++;
+                prunedEvent.thought = "[claude-prune: historical thinking compressed]";
             }
         }
         prunedEvents.push(prunedEvent);
@@ -180,9 +227,20 @@ function safeWriteFile(filePath, content) {
 function truncateOutputPayload(data, maxChars) {
     if (!data)
         return { data, didTruncate: false };
+    // If object with output property (e.g. { command: "npm test", output: "..." })
+    if (typeof data === "object" && data !== null && typeof data.output === "string") {
+        const res = truncateOutputPayload(data.output, maxChars);
+        if (res.didTruncate) {
+            return {
+                data: { ...data, output: res.data },
+                didTruncate: true,
+            };
+        }
+        return { data, didTruncate: false };
+    }
     const isString = typeof data === "string";
     const str = isString ? data : JSON.stringify(data);
-    if (str.length <= maxChars) {
+    if (str.length <= maxChars || str.includes("claude-prune: truncated")) {
         return { data, didTruncate: false };
     }
     const lines = str.split("\n");

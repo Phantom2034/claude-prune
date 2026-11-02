@@ -2,7 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { exec } from "node:child_process";
-import { discoverSessions, getClaudeProjectsDir } from "./locator.js";
+import { discoverSessions, getClaudeProjectsDir, getCodexSessionsDir } from "./locator.js";
 import { analyzeSession } from "./tree.js";
 import { pruneSessionFile, restoreBackup } from "./pruner.js";
 import { formatTokens, formatBytes, formatCurrency, estimateCacheReadCost } from "./meter.js";
@@ -20,7 +20,7 @@ export function startLocalDashboard(options: ServerOptions = {}): Promise<{ serv
   return new Promise((resolve, reject) => {
     let autoShieldEnabled = true;
     let sseClients: http.ServerResponse[] = [];
-    let fileWatcher: fs.FSWatcher | null = null;
+    const fileWatchers: fs.FSWatcher[] = [];
     let cachedStats: any = null;
     let isAnalyzing = false;
 
@@ -50,15 +50,19 @@ export function startLocalDashboard(options: ServerOptions = {}): Promise<{ serv
         let totalSaved = 0;
         let totalSize = 0;
         let totalDead = 0;
+        let claudeCount = 0;
+        let codexCount = 0;
 
         for (const s of sessions) {
           try {
-            const a = await analyzeSession(s.filePath, s.projectDisplayName);
+            const a = await analyzeSession(s.filePath, s.projectDisplayName, { agentType: s.agentType });
             analyses.push(a);
             totalRaw += a.rawEstimatedTokens;
             totalSaved += a.tokensSaved;
             totalSize += a.fileSizeBytes;
             totalDead += a.deadBranchEvents;
+            if (s.agentType === "codex") codexCount++;
+            else claudeCount++;
           } catch (err: any) {
             console.error(`Warning: Skipping session ${s.fileName}:`, err.message);
           }
@@ -66,6 +70,8 @@ export function startLocalDashboard(options: ServerOptions = {}): Promise<{ serv
 
         cachedStats = {
           sessionsCount: analyses.length,
+          claudeCount,
+          codexCount,
           totalSizeBytes: totalSize,
           totalRawTokens: totalRaw,
           totalSavedTokens: totalSaved,
@@ -80,47 +86,53 @@ export function startLocalDashboard(options: ServerOptions = {}): Promise<{ serv
       }
     }
 
-    // Initialize local file watcher for live shield
+    // Initialize local file watchers for live shield (Claude Code + Codex CLI)
     function initWatcher() {
-      const projectsDir = getClaudeProjectsDir();
-      if (!fs.existsSync(projectsDir)) return;
+      const watchDirs = [
+        { name: "Claude", dir: getClaudeProjectsDir() },
+        { name: "Codex", dir: getCodexSessionsDir() },
+      ].filter((w) => fs.existsSync(w.dir));
 
       let debounceTimer: NodeJS.Timeout | null = null;
-      try {
-        fileWatcher = fs.watch(projectsDir, { recursive: true }, (_eventType, filename) => {
-          if (filename && filename.endsWith(".jsonl") && !filename.endsWith(".bak.jsonl") && !filename.includes(".tmp.")) {
-            if (debounceTimer) clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(async () => {
-              if (!autoShieldEnabled) return;
-              try {
-                const sessions = discoverSessions();
-                if (sessions.length > 0) {
-                  const latest = sessions[0];
-                  const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
-                  if (res.tokensSaved > 0) {
-                    await getOrComputeStats(true); // invalidate cache
-                    broadcast("shield_event", {
-                      project: latest.projectDisplayName,
-                      file: latest.fileName,
-                      tokensSaved: res.tokensSaved,
-                      deadForks: res.deadEventsRemoved,
-                      logsTruncated: res.toolOutputsTruncated,
-                      message: `Auto-shielded ${latest.fileName.slice(0, 14)}: Spared ${formatTokens(res.tokensSaved)} tokens`,
-                    });
+      for (const { dir } of watchDirs) {
+        try {
+          const watcher = fs.watch(dir, { recursive: true }, (_eventType, filename) => {
+            if (filename && filename.endsWith(".jsonl") && !filename.endsWith(".bak.jsonl") && !filename.includes(".tmp.")) {
+              if (debounceTimer) clearTimeout(debounceTimer);
+              debounceTimer = setTimeout(async () => {
+                if (!autoShieldEnabled) return;
+                try {
+                  const sessions = discoverSessions();
+                  if (sessions.length > 0) {
+                    const latest = sessions[0];
+                    const res = await pruneSessionFile(latest.filePath, { dryRun: false, createBackup: false });
+                    if (res.tokensSaved > 0) {
+                      await getOrComputeStats(true); // invalidate cache
+                      broadcast("shield_event", {
+                        agent: latest.agentType,
+                        project: latest.projectDisplayName,
+                        file: latest.fileName,
+                        tokensSaved: res.tokensSaved,
+                        deadForks: res.deadEventsRemoved,
+                        logsTruncated: res.toolOutputsTruncated,
+                        message: `Auto-shielded [${latest.agentType.toUpperCase()}] ${latest.fileName.slice(0, 14)}: Spared ${formatTokens(res.tokensSaved)} tokens`,
+                      });
+                    }
                   }
+                } catch (err: any) {
+                  // If Agent is actively writing, silently wait for next idle turn
+                  if (err.code === "EPERM" || err.code === "EBUSY") {
+                    return;
+                  }
+                  console.error("Auto-shield notice:", err.message);
                 }
-              } catch (err: any) {
-                // If Claude Code is actively writing, silently wait for next idle turn
-                if (err.code === "EPERM" || err.code === "EBUSY") {
-                  return;
-                }
-                console.error("Auto-shield notice:", err.message);
-              }
-            }, 2000); // 2 second idle debounce
-          }
-        });
-      } catch (err: any) {
-        console.error("Watcher init error:", err.message);
+              }, 2000); // 2 second idle debounce
+            }
+          });
+          fileWatchers.push(watcher);
+        } catch (err: any) {
+          console.error("Watcher init error for", dir, err.message);
+        }
       }
     }
 
@@ -491,6 +503,40 @@ function getDashboardHtml(): string {
     }
     .badge-clean { background: rgba(16, 185, 129, 0.15); color: var(--green); }
     .badge-bloated { background: rgba(239, 68, 68, 0.15); color: var(--red); }
+    .badge-claude {
+      background: rgba(6, 182, 212, 0.12);
+      color: var(--cyan);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+    }
+    .badge-codex {
+      background: rgba(168, 85, 247, 0.15);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.35);
+    }
+    .agent-tabs {
+      display: flex;
+      gap: 8px;
+    }
+    .tab-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--card-border);
+      color: var(--text-dim);
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .tab-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+    }
+    .tab-btn.active {
+      background: rgba(6, 182, 212, 0.15);
+      border-color: var(--cyan);
+      color: #fff;
+    }
     .progress-bar-bg {
       background: rgba(255, 255, 255, 0.08);
       height: 6px;
@@ -647,7 +693,7 @@ function getDashboardHtml(): string {
         <div class="stat-sub">Anthropic cache pricing model</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Active Claude Sessions</div>
+        <div class="stat-label">Active Agent Sessions</div>
         <div class="stat-value" id="valSessions">--</div>
         <div class="stat-sub" id="valDiskSpace">Scanning disk...</div>
       </div>
@@ -656,9 +702,14 @@ function getDashboardHtml(): string {
     <div class="card">
       <div class="card-header">
         <div class="card-title">
-          <span>Active Claude Code Sessions</span>
+          <span>Active Agent Sessions</span>
         </div>
-        <div style="display: flex; gap: 10px;">
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <div class="agent-tabs">
+            <button class="tab-btn active" id="tabAll" onclick="setAgentFilter('all')">All (<span id="cntAll">0</span>)</button>
+            <button class="tab-btn" id="tabClaude" onclick="setAgentFilter('claude')">Claude (<span id="cntClaude">0</span>)</button>
+            <button class="tab-btn" id="tabCodex" onclick="setAgentFilter('codex')">Codex (<span id="cntCodex">0</span>)</button>
+          </div>
           <button class="btn" onclick="restoreBackups()">↺ Restore Backup</button>
           <button class="btn btn-primary" onclick="pruneAll()">⚡ Purge All Bloat</button>
         </div>
@@ -667,8 +718,9 @@ function getDashboardHtml(): string {
       <table>
         <thead>
           <tr>
+            <th>Agent</th>
             <th>Project / Directory</th>
-            <th>Session UUID</th>
+            <th>Session File</th>
             <th>Raw Context</th>
             <th>Pruning Savings</th>
             <th>Dead Forks</th>
@@ -677,7 +729,7 @@ function getDashboardHtml(): string {
           </tr>
         </thead>
         <tbody id="sessionTableBody">
-          <tr><td colspan="7" style="text-align: center; color: var(--text-dim); padding: 30px;">Loading sessions...</td></tr>
+          <tr><td colspan="8" style="text-align: center; color: var(--text-dim); padding: 30px;">Loading sessions...</td></tr>
         </tbody>
       </table>
     </div>
@@ -685,7 +737,7 @@ function getDashboardHtml(): string {
     <div class="card">
       <div class="card-header">
         <div class="card-title">Live Cache Shield Feed</div>
-        <span style="font-size: 0.8rem; color: var(--text-dim);">Listening to ~/.claude/projects/</span>
+        <span style="font-size: 0.8rem; color: var(--text-dim);">Listening to ~/.claude/projects/ & ~/.codex/sessions/</span>
       </div>
       <div class="feed" id="eventFeed">
         <div class="feed-item">
@@ -758,6 +810,7 @@ function getDashboardHtml(): string {
   <script>
     let currentSessions = [];
     let selectedSessionIdx = null;
+    let currentAgentFilter = 'all';
 
     async function loadStats(refresh = false) {
       try {
@@ -794,28 +847,54 @@ function getDashboardHtml(): string {
       return bytes + ' B';
     }
 
+    function setAgentFilter(filter) {
+      currentAgentFilter = filter;
+      document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+      const activeBtn = filter === 'claude' ? 'tabClaude' : filter === 'codex' ? 'tabCodex' : 'tabAll';
+      const el = document.getElementById(activeBtn);
+      if (el) el.classList.add('active');
+      renderTable();
+    }
+
     function renderDashboard(data) {
       document.getElementById('valSaved').textContent = formatNumber(data.totalSavedTokens || 0);
       document.getElementById('valForks').textContent = (data.totalDeadForks || 0).toLocaleString();
       document.getElementById('valCost').textContent = '$' + (data.estimatedDollarsSaved || 0).toFixed(2);
+      
+      const claudeCount = data.claudeCount || 0;
+      const codexCount = data.codexCount || 0;
       document.getElementById('valSessions').textContent = data.sessionsCount || 0;
-      document.getElementById('valDiskSpace').textContent = formatBytes(data.totalSizeBytes || 0) + ' log storage';
+      document.getElementById('valDiskSpace').textContent = \`\${formatBytes(data.totalSizeBytes || 0)} log storage (\${claudeCount} Claude, \${codexCount} Codex)\`;
 
+      document.getElementById('cntAll').textContent = data.sessionsCount || 0;
+      document.getElementById('cntClaude').textContent = claudeCount;
+      document.getElementById('cntCodex').textContent = codexCount;
+
+      renderTable();
+    }
+
+    function renderTable() {
       const tbody = document.getElementById('sessionTableBody');
-      const sessions = data.sessions || [];
-      if (sessions.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-dim); padding: 30px;">All sessions are clean! No bloated sessions found.</td></tr>';
+      const filtered = currentSessions.filter(s => currentAgentFilter === 'all' || s.agentType === currentAgentFilter);
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-dim); padding: 30px;">No sessions found for selected filter.</td></tr>';
         return;
       }
 
-      tbody.innerHTML = sessions.map((s, idx) => {
+      tbody.innerHTML = filtered.map((s) => {
+        const originalIdx = currentSessions.indexOf(s);
         const isOptimal = (s.tokensSaved || 0) === 0;
         const statusBadge = isOptimal 
           ? '<span class="badge badge-clean">OPTIMAL</span>' 
           : '<span class="badge badge-bloated">NEEDS PRUNING</span>';
+        const agentBadge = s.agentType === 'codex'
+          ? '<span class="badge badge-codex">CODEX</span>'
+          : '<span class="badge badge-claude">CLAUDE</span>';
         
         return \`
           <tr>
+            <td>\${agentBadge}</td>
             <td style="font-weight: 600; color: #fff;">\${escapeHtml(s.projectName || 'default')}</td>
             <td style="color: var(--text-dim);">\${(s.fileName || '').slice(0, 16)}...</td>
             <td>\${formatNumber(s.rawEstimatedTokens || 0)}</td>
@@ -828,11 +907,11 @@ function getDashboardHtml(): string {
             <td style="color: \${(s.deadBranchEvents || 0) > 0 ? 'var(--red)' : 'var(--text-dim)'}">\${(s.deadBranchEvents || 0).toLocaleString()}</td>
             <td>\${statusBadge}</td>
             <td>
-              <button class="btn" style="padding: 4px 8px; font-size: 0.75rem; margin-right: 4px;" onclick="openDiffModal(\${idx})">
+              <button class="btn" style="padding: 4px 8px; font-size: 0.75rem; margin-right: 4px;" onclick="openDiffModal(\${originalIdx})">
                 Inspect Diff
               </button>
               \${!isOptimal ? \`
-              <button class="btn btn-primary" style="padding: 4px 10px; font-size: 0.75rem;" onclick="pruneByIndex(\${idx})">
+              <button class="btn btn-primary" style="padding: 4px 10px; font-size: 0.75rem;" onclick="pruneByIndex(\${originalIdx})">
                 Prune
               </button>\` : \`
               <button class="btn" style="padding: 4px 10px; font-size: 0.75rem; opacity: 0.5; cursor: default;">

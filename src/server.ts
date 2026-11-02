@@ -939,8 +939,9 @@ function getDashboardHtml(): string {
       document.getElementById('modalTokensAfter').textContent = formatNumber(s.prunedEstimatedTokens) + ' tokens';
       document.getElementById('modalSizeAfter').textContent = formatBytes(estimatedNewSize);
 
+      const agentName = s.agentType === 'codex' ? 'Codex' : 'Claude';
       document.getElementById('modalSavingsHighlight').textContent = 
-        \`📉 Saves \${formatNumber(s.tokensSaved)} tokens (-\${s.savingsPercent}%) on every subsequent Claude turn!\`;
+        \`📉 Saves \${formatNumber(s.tokensSaved)} tokens (-\${s.savingsPercent}%) on every subsequent \${agentName} turn!\`;
 
       const pruneBtn = document.getElementById('modalPruneBtn');
       pruneBtn.onclick = () => {

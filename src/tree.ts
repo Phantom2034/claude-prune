@@ -244,6 +244,62 @@ export async function analyzeSession(
         }
       }
     }
+
+    // 9. Codex CLI official payload structure (custom_tool_call_output, item_completed, base64 images)
+    const p = event.payload;
+    if (p) {
+      // (a) custom_tool_call_output & function_call_output
+      if (p.type === "custom_tool_call_output" || p.type === "function_call_output") {
+        if (typeof p.output === "string") {
+          if (p.output.length > maxChars && !p.output.includes("claude-prune: truncated")) {
+            oversizedToolOutputs++;
+            tokensSaved += Math.max(0, Math.ceil((p.output.length - maxChars) / 3.8));
+          }
+        } else if (Array.isArray(p.output)) {
+          for (const block of p.output) {
+            if (block && typeof block.text === "string" && block.text.length > maxChars && !block.text.includes("claude-prune: truncated")) {
+              oversizedToolOutputs++;
+              tokensSaved += Math.max(0, Math.ceil((block.text.length - maxChars) / 3.8));
+            }
+          }
+        }
+      }
+
+      // (b) item_completed duplicate outputs
+      if (event.type === "event_msg" && p.type === "item_completed" && p.item) {
+        for (const outKey of ["result", "aggregated_output", "output"]) {
+          const val = p.item[outKey];
+          if (typeof val === "string" && val.length > maxChars && !val.includes("claude-prune: truncated")) {
+            oversizedToolOutputs++;
+            tokensSaved += Math.max(0, Math.ceil((val.length - maxChars) / 3.8));
+          }
+        }
+      }
+
+      // (c) Base64 images embedded in payload (e.g. screenshots duplicated across turns & compactions)
+      function scanForImages(node: any) {
+        if (!node) return;
+        if (typeof node === "object") {
+          for (const v of Object.values(node)) {
+            if (typeof v === "string" && v.startsWith("data:image/") && v.length > 500 && !v.includes("claude-prune: image")) {
+              oversizedToolOutputs++;
+              tokensSaved += Math.max(0, Math.ceil((v.length - 80) / 3.8));
+            } else if (typeof v === "object") {
+              scanForImages(v);
+            }
+          }
+        }
+      }
+      scanForImages(p);
+
+      // (d) Historical reasoning on older turns
+      if (isHistoricalTurn && p.type === "reasoning") {
+        const rVal = p.encrypted_content || p.content;
+        if (typeof rVal === "string" && rVal.length > 500 && !rVal.includes("claude-prune: historical")) {
+          tokensSaved += Math.max(0, Math.ceil((rVal.length - 80) / 3.8));
+        }
+      }
+    }
   }
 
   // Ensure tokensSaved does not exceed raw tokens

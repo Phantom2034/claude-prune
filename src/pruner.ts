@@ -137,6 +137,61 @@ export async function pruneSessionFile(
           toolOutputsTruncated++;
         }
       }
+
+      // Codex CLI: official payload structure (custom_tool_call_output, item_completed, base64 images)
+      const p = prunedEvent.payload;
+      if (p) {
+        // (a) custom_tool_call_output & function_call_output
+        if (p.type === "custom_tool_call_output" || p.type === "function_call_output") {
+          if (typeof p.output === "string") {
+            const res = truncateOutputPayload(p.output, maxToolChars);
+            if (res.didTruncate) {
+              p.output = res.data;
+              toolOutputsTruncated++;
+            }
+          } else if (Array.isArray(p.output)) {
+            for (const block of p.output) {
+              if (block && typeof block.text === "string") {
+                const res = truncateOutputPayload(block.text, maxToolChars);
+                if (res.didTruncate) {
+                  block.text = res.data;
+                  toolOutputsTruncated++;
+                }
+              }
+            }
+          }
+        }
+
+        // (b) item_completed duplicate outputs
+        if (prunedEvent.type === "event_msg" && p.type === "item_completed" && p.item) {
+          for (const outKey of ["result", "aggregated_output", "output"]) {
+            const val = p.item[outKey];
+            if (typeof val === "string") {
+              const res = truncateOutputPayload(val, maxToolChars);
+              if (res.didTruncate) {
+                p.item[outKey] = res.data;
+                toolOutputsTruncated++;
+              }
+            }
+          }
+        }
+
+        // (c) Base64 images compacted across payload and replacement_history
+        function cleanImages(node: any) {
+          if (!node) return;
+          if (typeof node === "object") {
+            for (const [k, v] of Object.entries(node)) {
+              if (typeof v === "string" && v.startsWith("data:image/") && v.length > 500 && !v.includes("claude-prune: image")) {
+                node[k] = `[claude-prune: image payload compacted (${Math.round(v.length / 3.8)} tokens saved)]`;
+                toolOutputsTruncated++;
+              } else if (typeof v === "object") {
+                cleanImages(v);
+              }
+            }
+          }
+        }
+        cleanImages(p);
+      }
     }
 
     // Historical thinking / reasoning compression (Claude Code + Codex)
@@ -157,6 +212,13 @@ export async function pruneSessionFile(
       if (typeof prunedEvent.thought === "string" && prunedEvent.thought.length > 500 && !prunedEvent.thought.includes("historical thinking compressed")) {
         thinkingBlocksCompressed++;
         prunedEvent.thought = "[claude-prune: historical thinking compressed]";
+      }
+      if (prunedEvent.payload?.type === "reasoning") {
+        const rVal = prunedEvent.payload.encrypted_content || prunedEvent.payload.content;
+        if (typeof rVal === "string" && rVal.length > 500 && !rVal.includes("claude-prune: historical")) {
+          thinkingBlocksCompressed++;
+          prunedEvent.payload.encrypted_content = "[claude-prune: historical reasoning trace compressed]";
+        }
       }
     }
 
